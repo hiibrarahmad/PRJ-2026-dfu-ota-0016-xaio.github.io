@@ -6,7 +6,7 @@ import re
 
 def replace_define(contents: str, key: str, value: str) -> str:
     pattern = rf'(#define\s+{re.escape(key)}\s+)(.+)'
-    return re.sub(pattern, rf'\1{value}', contents)
+    return re.sub(pattern, lambda match: f"{match.group(1)}{value}", contents)
 
 
 def main() -> None:
@@ -27,4 +27,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
