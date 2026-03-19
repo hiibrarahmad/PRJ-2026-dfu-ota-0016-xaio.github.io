@@ -1,0 +1,146 @@
+name: Build Firmware Draft Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*-stable"
+      - "v*.*.*-beta"
+      - "v*.*.*-dev"
+
+env:
+  BOARD_FQBN: Seeeduino:nrf52:xiaonRF52840
+  VERSION_HEADER: firmware/eeg_test/version.h
+  SKETCH_PATH: firmware/eeg_test
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Parse tag
+        id: tag
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="$(echo "$TAG" | sed -E 's/^v([0-9]+\.[0-9]+\.[0-9]+)-(stable|beta|dev)$/\1/')"
+          CHANNEL="$(echo "$TAG" | grep -oE '(stable|beta|dev)$')"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          VERSION_CODE="$(( MAJOR * 10000 + MINOR * 100 + PATCH ))"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+
+      - name: Install arduino-cli
+        shell: bash
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR="$HOME/bin" sh
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Install Seeed nRF52 core
+        shell: bash
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
+          arduino-cli core update-index
+          arduino-cli core install Seeeduino:nrf52@1.1.12
+
+      - name: Install adafruit-nrfutil
+        run: python -m pip install --upgrade pip adafruit-nrfutil
+
+      - name: Sync version header
+        run: |
+          python scripts/write_version_header.py \
+            --header "${{ env.VERSION_HEADER }}" \
+            --semver "${{ steps.tag.outputs.version }}" \
+            --version-code "${{ steps.tag.outputs.version_code }}" \
+            --channel "${{ steps.tag.outputs.channel }}"
+
+      - name: Compile firmware
+        run: |
+          arduino-cli compile \
+            --fqbn "${{ env.BOARD_FQBN }}" \
+            --build-path build \
+            "${{ env.SKETCH_PATH }}"
+
+      - name: Restore signing keys
+        shell: bash
+        run: |
+          mkdir -p /tmp/keys
+          echo "${{ secrets.DFU_BOOTLOADER_PRIVATE_KEY_PEM_BASE64 }}" | base64 -d > /tmp/keys/dfu_bootloader_private.pem
+          echo "${{ secrets.APP_SIGNATURE_PRIVATE_KEY_PEM_BASE64 }}" | base64 -d > /tmp/keys/app_signature_private.pem
+
+      - name: Build DFU package
+        run: |
+          adafruit-nrfutil dfu genpkg \
+            --dev-type 0x0052 \
+            --sd-req 0x0123 \
+            --application "build/eeg_test.ino.hex" \
+            --application-version "${{ steps.tag.outputs.version_code }}" \
+            --key-file /tmp/keys/dfu_bootloader_private.pem \
+            firmware.zip
+
+      - name: Sign ZIP for Android app verification
+        run: |
+          openssl dgst -sha256 -sign /tmp/keys/app_signature_private.pem -out firmware.zip.sig firmware.zip
+          sha256sum firmware.zip | awk '{print $1}' > firmware.zip.sha256
+
+      - name: Generate release metadata
+        run: |
+          python scripts/generate_release_metadata.py \
+            --header "${{ env.VERSION_HEADER }}" \
+            --tag "${{ steps.tag.outputs.tag }}" \
+            --output release-metadata.json
+
+      - name: Create draft release notes
+        shell: bash
+        run: |
+          cat > release-notes.md <<EOF
+          ## Firmware ${{ steps.tag.outputs.version }} (${{ steps.tag.outputs.channel }})
+
+          Replace these notes before publishing.
+
+          - Summary of what improved
+          - Known limitations
+          - Upgrade or downgrade cautions
+
+          ## Release metadata
+
+          - Version code: ${{ steps.tag.outputs.version_code }}
+          - Channel: ${{ steps.tag.outputs.channel }}
+          - Hardware: xiao-nrf52840-r1
+          EOF
+
+      - name: Create draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          PRERELEASE_FLAG=""
+          if [ "${{ steps.tag.outputs.channel }}" != "stable" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            firmware.zip \
+            firmware.zip.sha256 \
+            firmware.zip.sig \
+            release-metadata.json \
+            --repo "${{ github.repository }}" \
+            --draft \
+            $PRERELEASE_FLAG \
+            --title "Firmware ${{ steps.tag.outputs.version }} (${{ steps.tag.outputs.channel }})" \
+            --notes-file release-notes.md
+
+      - name: Cleanup keys
+        if: always()
+        shell: bash
+        run: |
+          shred -u /tmp/keys/dfu_bootloader_private.pem || rm -f /tmp/keys/dfu_bootloader_private.pem
+          shred -u /tmp/keys/app_signature_private.pem || rm -f /tmp/keys/app_signature_private.pem

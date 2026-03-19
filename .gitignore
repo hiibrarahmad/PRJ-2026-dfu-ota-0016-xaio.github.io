@@ -1,0 +1,28 @@
+.gradle/
+.gradle-dist/
+.idea/
+build/
+*/build/
+local.properties
+captures/
+*.iml
+*.log
+*.tmp
+*.orig
+
+# Android signing and local secrets
+*.jks
+*.keystore
+keys/*.pem
+!keys/*.example.pem
+!keys/dfu_bootloader_public.pem
+!keys/app_signature_public.pem
+
+# OTA working artifacts
+dist/
+tmp/
+out/
+firmware.zip
+firmware.zip.sig
+firmware.zip.sha256
+gradle-*-bin.zip
