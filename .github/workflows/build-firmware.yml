@@ -64,6 +64,7 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          import nordicsemi.dfu.manifest as manifest
           import nordicsemi.dfu.signing as signing
 
           signing_path = Path(signing.__file__)
@@ -77,6 +78,21 @@ jobs:
               print(f"Patched {signing_path}")
           else:
               print(f"No patch needed for {signing_path}")
+
+          manifest_path = Path(manifest.__file__)
+          manifest_original = manifest_path.read_text(encoding="utf-8")
+          manifest_patched = manifest_original.replace(
+              "init_packet_data.firmware_hash = binascii.hexlify(field)",
+              "init_packet_data.firmware_hash = binascii.hexlify(field).decode('ascii')",
+          ).replace(
+              "init_packet_data.init_packet_ecds = binascii.hexlify(field)",
+              "init_packet_data.init_packet_ecds = binascii.hexlify(field).decode('ascii')",
+          )
+          if manifest_original != manifest_patched:
+              manifest_path.write_text(manifest_patched, encoding="utf-8")
+              print(f"Patched {manifest_path}")
+          else:
+              print(f"No patch needed for {manifest_path}")
           PY
 
       - name: Sync version header
