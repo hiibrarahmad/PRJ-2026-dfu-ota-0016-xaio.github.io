@@ -456,11 +456,18 @@ class OtaViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun startNordicDfu(zipFile: File, deviceAddress: String) {
         val context = getApplication<Application>()
+        DfuServiceInitiator.createDfuNotificationChannel(context)
         DfuServiceInitiator(deviceAddress)
+            .setDeviceName(uiState.value.selectedDeviceName)
             .setZip(zipFile.absolutePath)
+            .setForeground(true)
             .setKeepBond(false)
             .setDisableNotification(false)
             .setNumberOfRetries(1)
+            .setRebootTime(1200L)
+            .setScanTimeout(10_000L)
+            .setPrepareDataObjectDelay(300L)
+            .setForceScanningForNewAddressInLegacyDfu(true)
             .setPacketsReceiptNotificationsEnabled(true)
             .setPacketsReceiptNotificationsValue(10)
             .start(context, OtaDfuService::class.java)
