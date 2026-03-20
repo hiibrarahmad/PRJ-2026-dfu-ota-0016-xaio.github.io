@@ -29,7 +29,8 @@
 
         <service
             android:name=".dfu.OtaDfuService"
-            android:exported="false" />
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
 
         <activity
             android:name=".MainActivity"
@@ -42,4 +43,3 @@
     </application>
 
 </manifest>
-

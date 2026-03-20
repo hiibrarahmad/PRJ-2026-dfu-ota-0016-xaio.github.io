@@ -32,6 +32,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 class OtaViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -40,7 +41,12 @@ class OtaViewModel(application: Application) : AndroidViewModel(application) {
     private val catalogRepository = ReleaseCatalogRepository(application)
     private val policyEngine = OtaPolicyEngine(application)
     private val auditLog = AuditLog(application)
-    private val httpClient = OkHttpClient()
+    private val httpClient = OkHttpClient.Builder()
+        .retryOnConnectionFailure(true)
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(120, TimeUnit.SECONDS)
+        .callTimeout(120, TimeUnit.SECONDS)
+        .build()
 
     private var snapshot: ReleaseCatalogSnapshot? = null
     private var activeInstall: ActiveInstall? = null
@@ -259,17 +265,45 @@ class OtaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun onDfuCompleted() {
-        activeInstall?.let { install ->
+        val install = activeInstall
+        install?.let {
             auditLog.record(install.auditEntry(result = "completed", reason = install.reason))
         }
         activeInstall = null
-        _uiState.update {
-            it.copy(
-                busyMessage = null,
-                flashProgress = 100,
-                statusMessage = "DFU completed successfully.",
-                errorMessage = null,
+        if (install != null) {
+            val updatedDevice = install.device.copy(
+                firmwareRev = install.release.version,
+                softwareRev = install.release.channel,
+                versionCode = install.release.versionCode,
+                securityEpoch = install.release.securityEpoch,
+                channel = install.release.channel,
             )
+            _uiState.update {
+                it.copy(
+                    deviceVersion = updatedDevice,
+                    busyMessage = null,
+                    flashProgress = 100,
+                    errorMessage = null,
+                )
+            }
+            refreshReleasePresentation()
+            _uiState.update {
+                it.copy(
+                    busyMessage = null,
+                    flashProgress = 100,
+                    errorMessage = null,
+                    statusMessage = "DFU completed. Let the board reboot, then reconnect to confirm ${install.release.version}.",
+                )
+            }
+        } else {
+            _uiState.update {
+                it.copy(
+                    busyMessage = null,
+                    flashProgress = 100,
+                    statusMessage = "DFU completed successfully.",
+                    errorMessage = null,
+                )
+            }
         }
     }
 
@@ -355,14 +389,28 @@ class OtaViewModel(application: Application) : AndroidViewModel(application) {
             val otaDir = File(getApplication<Application>().cacheDir, "ota").apply { mkdirs() }
             val zipFile = downloadFile(release.url, File(otaDir, "${release.tag}.zip"), true) { progress ->
                 _uiState.update { state -> state.copy(downloadProgress = progress) }
-            } ?: run {
-                _uiState.update { it.copy(busyMessage = null, errorMessage = "Firmware download failed.") }
+            }.getOrElse { error ->
+                _uiState.update {
+                    it.copy(
+                        busyMessage = null,
+                        downloadProgress = null,
+                        errorMessage = error.message ?: "Firmware download failed.",
+                        statusMessage = "Could not download ${release.version}.",
+                    )
+                }
                 return@launch
             }
 
             val sigFile = downloadFile(release.sigUrl, File(otaDir, "${release.tag}.zip.sig"), false) { }
-                ?: run {
-                    _uiState.update { it.copy(busyMessage = null, errorMessage = "Signature download failed.") }
+                .getOrElse { error ->
+                    _uiState.update {
+                        it.copy(
+                            busyMessage = null,
+                            downloadProgress = null,
+                            errorMessage = error.message ?: "Signature download failed.",
+                            statusMessage = "Could not download the signature file for ${release.version}.",
+                        )
+                    }
                     return@launch
                 }
 
@@ -423,33 +471,73 @@ class OtaViewModel(application: Application) : AndroidViewModel(application) {
         destination: File,
         reportProgress: Boolean,
         onProgress: (Int) -> Unit,
-    ): File? = withContext(Dispatchers.IO) {
-        runCatching {
-            val request = Request.Builder().url(url).build()
-            httpClient.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    error("HTTP ${response.code} while downloading $url")
-                }
-                val body = response.body ?: error("Missing response body while downloading $url")
-                val total = body.contentLength()
-                destination.outputStream().use { output ->
-                    body.byteStream().use { input ->
-                        val buffer = ByteArray(8192)
-                        var downloaded = 0L
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read == -1) break
-                            output.write(buffer, 0, read)
-                            downloaded += read
-                            if (reportProgress && total > 0L) {
-                                onProgress((downloaded * 100 / total).toInt())
+    ): Result<File> = withContext(Dispatchers.IO) {
+        destination.parentFile?.mkdirs()
+        var lastError: Throwable? = null
+
+        repeat(3) { attempt ->
+            val tempFile = File(destination.parentFile, "${destination.name}.part")
+            tempFile.delete()
+
+            val result = runCatching {
+                val request = Request.Builder()
+                    .url(url)
+                    .header("Accept", "application/octet-stream")
+                    .build()
+
+                httpClient.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        error("HTTP ${response.code} while downloading ${destination.name}")
+                    }
+                    val body = response.body ?: error("Missing response body while downloading ${destination.name}")
+                    val total = body.contentLength()
+                    tempFile.outputStream().use { output ->
+                        body.byteStream().use { input ->
+                            val buffer = ByteArray(8192)
+                            var downloaded = 0L
+                            while (true) {
+                                val read = input.read(buffer)
+                                if (read == -1) break
+                                output.write(buffer, 0, read)
+                                downloaded += read
+                                if (reportProgress && total > 0L) {
+                                    onProgress((downloaded * 100 / total).toInt())
+                                }
                             }
                         }
                     }
                 }
+
+                if (destination.exists()) {
+                    destination.delete()
+                }
+                if (!tempFile.renameTo(destination)) {
+                    tempFile.copyTo(destination, overwrite = true)
+                    tempFile.delete()
+                }
+                if (reportProgress) {
+                    onProgress(100)
+                }
+                destination
             }
-            destination
-        }.getOrNull()
+
+            if (result.isSuccess) {
+                return@withContext result
+            }
+
+            lastError = result.exceptionOrNull()
+            tempFile.delete()
+            if (attempt < 2) {
+                delay((attempt + 1) * 700L)
+            }
+        }
+
+        Result.failure(
+            IllegalStateException(
+                "Download failed after retries: ${lastError?.message ?: destination.name}",
+                lastError,
+            ),
+        )
     }
 
     private fun compareDirection(device: DeviceVersion, release: ReleaseRecord): String = when {

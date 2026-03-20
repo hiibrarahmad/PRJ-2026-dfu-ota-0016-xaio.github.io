@@ -1,4 +1,5 @@
 #include <bluefruit.h>
+#include <string.h>
 #include "version.h"
 
 namespace {
@@ -8,6 +9,13 @@ constexpr char MANUFACTURER_NAME[] = "XAIO";
 constexpr char VERSION_SERVICE_UUID[] = "12345678-1234-1234-1234-123456789abc";
 constexpr char VERSION_CHAR_UUID[] = "12345678-1234-1234-1234-123456789abd";
 constexpr size_t VERSION_JSON_CAPACITY = 160;
+
+enum class DemoPattern : uint8_t {
+  kLegacyDevRed,
+  kUpdatedDevGreen,
+  kBetaBlueBlink,
+  kStableRgbCycle,
+};
 }
 
 BLEDfu bleDfu;
@@ -16,6 +24,30 @@ BLEService versionService(VERSION_SERVICE_UUID);
 BLECharacteristic versionChar(VERSION_CHAR_UUID);
 
 char versionJson[VERSION_JSON_CAPACITY];
+DemoPattern activePattern = DemoPattern::kLegacyDevRed;
+
+void writeLed(uint8_t pin, bool enabled) {
+  digitalWrite(pin, enabled ? LOW : HIGH);
+}
+
+void showColor(bool red, bool green, bool blue) {
+  writeLed(LED_RED, red);
+  writeLed(LED_GREEN, green);
+  writeLed(LED_BLUE, blue);
+}
+
+DemoPattern resolvePattern() {
+  if (strcmp(FW_CHANNEL, "stable") == 0) {
+    return DemoPattern::kStableRgbCycle;
+  }
+  if (strcmp(FW_CHANNEL, "beta") == 0) {
+    return DemoPattern::kBetaBlueBlink;
+  }
+  if (FW_VERSION_CODE >= 105) {
+    return DemoPattern::kUpdatedDevGreen;
+  }
+  return DemoPattern::kLegacyDevRed;
+}
 
 void updateVersionPayload() {
   snprintf(
@@ -49,6 +81,28 @@ void setupVersionService() {
   versionChar.write(versionJson, strlen(versionJson));
 }
 
+void setupLedPattern() {
+  pinMode(LED_RED, OUTPUT);
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_BLUE, OUTPUT);
+  showColor(false, false, false);
+  activePattern = resolvePattern();
+  switch (activePattern) {
+    case DemoPattern::kLegacyDevRed:
+      showColor(true, false, false);
+      break;
+    case DemoPattern::kUpdatedDevGreen:
+      showColor(false, true, false);
+      break;
+    case DemoPattern::kBetaBlueBlink:
+      showColor(false, false, true);
+      break;
+    case DemoPattern::kStableRgbCycle:
+      showColor(true, false, false);
+      break;
+  }
+}
+
 void startAdvertising() {
   Bluefruit.Advertising.stop();
   Bluefruit.ScanResponse.clearData();
@@ -69,9 +123,6 @@ void startAdvertising() {
 }
 
 void setup() {
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, HIGH);
-
   Bluefruit.begin();
   Bluefruit.setName(DEVICE_NAME);
   Bluefruit.setTxPower(4);
@@ -79,17 +130,44 @@ void setup() {
   bleDfu.begin();
   setupDeviceInformationService();
   setupVersionService();
+  setupLedPattern();
   startAdvertising();
 }
 
 void loop() {
-  static uint32_t lastBlinkAt = 0;
-  static bool ledOn = false;
+  static uint32_t lastStepAt = 0;
+  static bool betaLedOn = false;
+  static uint8_t stableStep = 0;
 
-  if (millis() - lastBlinkAt >= 1000) {
-    lastBlinkAt = millis();
-    ledOn = !ledOn;
-    digitalWrite(LED_BUILTIN, ledOn ? LOW : HIGH);
+  switch (activePattern) {
+    case DemoPattern::kLegacyDevRed:
+      showColor(true, false, false);
+      break;
+
+    case DemoPattern::kUpdatedDevGreen:
+      showColor(false, true, false);
+      break;
+
+    case DemoPattern::kBetaBlueBlink:
+      if (millis() - lastStepAt >= 350) {
+        lastStepAt = millis();
+        betaLedOn = !betaLedOn;
+        showColor(false, false, betaLedOn);
+      }
+      break;
+
+    case DemoPattern::kStableRgbCycle:
+      if (millis() - lastStepAt >= 450) {
+        lastStepAt = millis();
+        stableStep = (stableStep + 1) % 3;
+        if (stableStep == 0) {
+          showColor(true, false, false);
+        } else if (stableStep == 1) {
+          showColor(false, true, false);
+        } else {
+          showColor(false, false, true);
+        }
+      }
+      break;
   }
 }
-
