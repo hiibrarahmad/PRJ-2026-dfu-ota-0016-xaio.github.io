@@ -464,12 +464,14 @@ class OtaViewModel(application: Application) : AndroidViewModel(application) {
             .setKeepBond(false)
             .setDisableNotification(false)
             .setNumberOfRetries(1)
-            .setRebootTime(1200L)
-            .setScanTimeout(10_000L)
-            .setPrepareDataObjectDelay(300L)
+            .setRebootTime(0L)
+            .setScanTimeout(2_000L)
+            .setPrepareDataObjectDelay(0L)
             .setForceScanningForNewAddressInLegacyDfu(true)
+            .disableResume()
+            .disableMtuRequest()
             .setPacketsReceiptNotificationsEnabled(true)
-            .setPacketsReceiptNotificationsValue(10)
+            .setPacketsReceiptNotificationsValue(30)
             .start(context, OtaDfuService::class.java)
     }
 
