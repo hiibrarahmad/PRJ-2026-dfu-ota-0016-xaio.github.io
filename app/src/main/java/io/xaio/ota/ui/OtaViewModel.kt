@@ -18,6 +18,7 @@ import io.xaio.ota.model.ScannedBleDevice
 import io.xaio.ota.policy.OtaPolicyEngine
 import io.xaio.ota.storage.AuditLog
 import io.xaio.ota.storage.ReleaseCatalogRepository
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -101,6 +102,16 @@ class OtaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun connectToScannedDevice(device: ScannedBleDevice) {
+        if (!device.isConnectable) {
+            _uiState.update {
+                it.copy(
+                    errorMessage = "The selected BLE device is not advertising as connectable. Pick another device or rescan.",
+                    statusMessage = "Select a connectable XAIO device from the list.",
+                )
+            }
+            return
+        }
+
         bleScanner.stop()
         _uiState.update {
             it.copy(
@@ -111,7 +122,11 @@ class OtaViewModel(application: Application) : AndroidViewModel(application) {
                 statusMessage = "Connecting to ${device.name}.",
             )
         }
-        readDeviceAndRefresh()
+
+        viewModelScope.launch {
+            delay(600)
+            readDeviceAndRefresh()
+        }
     }
 
     fun selectChannel(channel: String) {
@@ -142,6 +157,7 @@ class OtaViewModel(application: Application) : AndroidViewModel(application) {
                     it.copy(
                         busyMessage = null,
                         errorMessage = error.message ?: "Could not read the device over BLE.",
+                        statusMessage = "BLE connection to the selected device failed.",
                     )
                 }
                 return@launch

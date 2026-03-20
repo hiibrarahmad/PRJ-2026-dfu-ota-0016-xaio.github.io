@@ -354,8 +354,22 @@ private fun ScannedDeviceCard(
             Text(device.name, style = MaterialTheme.typography.titleSmall)
             Text(device.address)
             Text("Signal: ${device.rssi} dBm")
+            Text(
+                if (device.isConnectable) "Connectable" else "Not connectable",
+                color = if (device.isConnectable) {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    MaterialTheme.colorScheme.error
+                },
+            )
+            if (device.advertisesVersionService) {
+                Text("Version service detected")
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Button(onClick = onConnectClick) {
+                Button(
+                    onClick = onConnectClick,
+                    enabled = device.isConnectable,
+                ) {
                     Text(if (isSelected) "Reconnect" else "Connect")
                 }
                 if (isSelected) {

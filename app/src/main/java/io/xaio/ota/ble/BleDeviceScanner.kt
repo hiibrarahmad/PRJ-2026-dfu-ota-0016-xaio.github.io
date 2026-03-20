@@ -104,6 +104,8 @@ class BleDeviceScanner(private val context: Context) {
             address = address,
             name = deviceName,
             rssi = result.rssi,
+            isConnectable = isConnectable(result),
+            advertisesVersionService = advertisesVersionService,
         )
     }
 
@@ -116,11 +118,19 @@ class BleDeviceScanner(private val context: Context) {
     private fun scanPriority(device: ScannedBleDevice): Int {
         val name = device.name.uppercase()
         return when {
-            name.contains("XAIO") -> 3
-            name.contains("XIAO") -> 2
+            device.advertisesVersionService && device.isConnectable -> 5
+            name.contains("XAIO") && device.isConnectable -> 4
+            name.contains("XIAO") && device.isConnectable -> 3
+            device.isConnectable && !name.startsWith("UNNAMED") -> 2
             !name.startsWith("UNNAMED") -> 1
             else -> 0
         }
+    }
+
+    private fun isConnectable(result: ScanResult): Boolean = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        result.isConnectable
+    } else {
+        true
     }
 
     private fun hasScanPermission(): Boolean = when {

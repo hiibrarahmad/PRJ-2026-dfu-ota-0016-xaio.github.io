@@ -10,10 +10,13 @@ import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import androidx.core.content.ContextCompat
 import com.google.gson.Gson
 import io.xaio.ota.AppConfig
 import io.xaio.ota.model.DeviceVersion
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -26,166 +29,205 @@ class BleDeviceVersionReader(private val context: Context) {
     private val gson = Gson()
 
     suspend fun read(deviceAddress: String): Result<DeviceVersion> = withContext(Dispatchers.IO) {
-        runCatching {
-            checkBluetoothPermission()
-            withTimeout(20_000L) {
-                suspendCancellableCoroutine { continuation ->
-                    val bluetoothManager = context.getSystemService(BluetoothManager::class.java)
-                    val adapter = bluetoothManager.adapter ?: error("Bluetooth adapter unavailable.")
-                    check(adapter.isEnabled) { "Bluetooth is turned off." }
+        checkBluetoothPermission()
+        var lastError: Throwable? = null
+        repeat(3) { attempt ->
+            if (attempt > 0) {
+                delay(900L)
+            } else {
+                delay(500L)
+            }
 
-                    val device = adapter.getRemoteDevice(deviceAddress)
-                    var gatt: BluetoothGatt? = null
+            val result = runCatching { connectAndRead(deviceAddress) }
+            if (result.isSuccess) {
+                return@withContext result
+            }
 
-                    val callback = object : BluetoothGattCallback() {
-                        val disValues = mutableMapOf<String, String>()
-                        var payload: ExtendedVersionPayload? = null
+            lastError = result.exceptionOrNull()
+            if (!isRetryableGattFailure(lastError)) {
+                return@withContext Result.failure(lastError ?: IllegalStateException("BLE version read failed."))
+            }
+        }
 
-                        override fun onConnectionStateChange(gattConn: BluetoothGatt, status: Int, newState: Int) {
-                            if (status != BluetoothGatt.GATT_SUCCESS) {
-                                finishWithError(gattConn, "BLE connection failed with status $status")
-                                return
-                            }
+        Result.failure(
+            IllegalStateException(
+                "BLE connection failed after retries. On some phones this is a transient Android GATT issue. " +
+                    "Move closer to the device, keep it advertising, and try again.",
+                lastError,
+            ),
+        )
+    }
 
-                            when (newState) {
-                                BluetoothProfile.STATE_CONNECTED -> gattConn.discoverServices()
-                                BluetoothProfile.STATE_DISCONNECTED -> {
-                                    if (continuation.isActive) {
-                                        continuation.resume(Result.failure(IllegalStateException("Disconnected before version read completed.")))
-                                    }
-                                    gattConn.close()
-                                }
-                            }
-                        }
+    private suspend fun connectAndRead(deviceAddress: String): DeviceVersion = withTimeout(20_000L) {
+        suspendCancellableCoroutine { continuation ->
+            val bluetoothManager = context.getSystemService(BluetoothManager::class.java)
+            val adapter = bluetoothManager.adapter ?: error("Bluetooth adapter unavailable.")
+            check(adapter.isEnabled) { "Bluetooth is turned off." }
 
-                        override fun onServicesDiscovered(gattConn: BluetoothGatt, status: Int) {
-                            if (status != BluetoothGatt.GATT_SUCCESS) {
-                                finishWithError(gattConn, "BLE service discovery failed with status $status")
-                                return
-                            }
-                            readCharacteristic(gattConn, AppConfig.deviceInfoServiceUuid, AppConfig.firmwareRevisionUuid)
-                        }
+            val device = adapter.getRemoteDevice(deviceAddress)
+            var gatt: BluetoothGatt? = null
 
-                        override fun onCharacteristicRead(
-                            gattConn: BluetoothGatt,
-                            characteristic: BluetoothGattCharacteristic,
-                            value: ByteArray,
-                            status: Int,
-                        ) {
-                            handleCharacteristicRead(gattConn, characteristic, value, status)
-                        }
+            val callback = object : BluetoothGattCallback() {
+                val disValues = mutableMapOf<String, String>()
+                var payload: ExtendedVersionPayload? = null
 
-                        @Deprecated("Deprecated in Java")
-                        override fun onCharacteristicRead(
-                            gattConn: BluetoothGatt,
-                            characteristic: BluetoothGattCharacteristic,
-                            status: Int,
-                        ) {
-                            handleCharacteristicRead(
-                                gattConn,
-                                characteristic,
-                                characteristic.value ?: ByteArray(0),
-                                status,
-                            )
-                        }
+                override fun onConnectionStateChange(gattConn: BluetoothGatt, status: Int, newState: Int) {
+                    if (status != BluetoothGatt.GATT_SUCCESS) {
+                        finishWithError(gattConn, "BLE connection failed with status $status")
+                        return
+                    }
 
-                        private fun handleCharacteristicRead(
-                            gattConn: BluetoothGatt,
-                            characteristic: BluetoothGattCharacteristic,
-                            value: ByteArray,
-                            status: Int,
-                        ) {
-                            if (status != BluetoothGatt.GATT_SUCCESS) {
-                                finishWithError(gattConn, "BLE read failed for ${characteristic.uuid} with status $status")
-                                return
-                            }
-
-                            val text = value.toString(StandardCharsets.UTF_8).trimEnd('\u0000')
-                            when (characteristic.uuid) {
-                                AppConfig.firmwareRevisionUuid -> {
-                                    disValues["firmware"] = text
-                                    readCharacteristic(gattConn, AppConfig.deviceInfoServiceUuid, AppConfig.softwareRevisionUuid)
-                                }
-                                AppConfig.softwareRevisionUuid -> {
-                                    disValues["software"] = text
-                                    readCharacteristic(gattConn, AppConfig.deviceInfoServiceUuid, AppConfig.hardwareRevisionUuid)
-                                }
-                                AppConfig.hardwareRevisionUuid -> {
-                                    disValues["hardware"] = text
-                                    val service = gattConn.getService(AppConfig.versionServiceUuid)
-                                    val versionCharacteristic = service?.getCharacteristic(AppConfig.versionCharacteristicUuid)
-                                    if (versionCharacteristic == null) {
-                                        completeSuccess(gattConn)
-                                    } else {
-                                        gattConn.readCharacteristic(versionCharacteristic)
-                                    }
-                                }
-                                AppConfig.versionCharacteristicUuid -> {
-                                    payload = runCatching { gson.fromJson(text, ExtendedVersionPayload::class.java) }.getOrNull()
-                                    completeSuccess(gattConn)
-                                }
-                                else -> completeSuccess(gattConn)
-                            }
-                        }
-
-                        private fun readCharacteristic(
-                            gattConn: BluetoothGatt,
-                            serviceUuid: java.util.UUID,
-                            characteristicUuid: java.util.UUID,
-                        ) {
-                            val service = gattConn.getService(serviceUuid)
-                                ?: return finishWithError(gattConn, "Missing BLE service $serviceUuid")
-                            val characteristic = service.getCharacteristic(characteristicUuid)
-                                ?: return finishWithError(gattConn, "Missing BLE characteristic $characteristicUuid")
-                            gattConn.readCharacteristic(characteristic)
-                        }
-
-                        private fun completeSuccess(gattConn: BluetoothGatt) {
-                            if (!continuation.isActive) {
-                                gattConn.close()
-                                return
-                            }
-                            val firmware = payload?.fw ?: disValues["firmware"].orEmpty()
-                            val channel = payload?.channel ?: disValues["software"].orEmpty()
-                            val hardware = payload?.hw ?: disValues["hardware"].orEmpty()
-                            continuation.resume(
-                                Result.success(
-                                    DeviceVersion(
-                                        firmwareRev = firmware,
-                                        softwareRev = channel,
-                                        hardwareRev = hardware,
-                                        versionCode = payload?.code ?: DeviceVersion.fromSemver(firmware),
-                                        securityEpoch = payload?.epoch ?: 0,
-                                        channel = if (channel.isBlank()) "stable" else channel,
-                                    ),
-                                ),
-                            )
-                            gattConn.disconnect()
-                            gattConn.close()
-                        }
-
-                        private fun finishWithError(gattConn: BluetoothGatt, message: String) {
+                    when (newState) {
+                        BluetoothProfile.STATE_CONNECTED -> gattConn.discoverServices()
+                        BluetoothProfile.STATE_DISCONNECTED -> {
                             if (continuation.isActive) {
-                                continuation.resume(Result.failure(IllegalStateException(message)))
+                                continuation.resume(Result.failure(IllegalStateException("Disconnected before version read completed.")))
                             }
-                            gattConn.disconnect()
                             gattConn.close()
                         }
                     }
+                }
 
-                    gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                override fun onServicesDiscovered(gattConn: BluetoothGatt, status: Int) {
+                    if (status != BluetoothGatt.GATT_SUCCESS) {
+                        finishWithError(gattConn, "BLE service discovery failed with status $status")
+                        return
+                    }
+                    readCharacteristic(gattConn, AppConfig.deviceInfoServiceUuid, AppConfig.firmwareRevisionUuid)
+                }
+
+                override fun onCharacteristicRead(
+                    gattConn: BluetoothGatt,
+                    characteristic: BluetoothGattCharacteristic,
+                    value: ByteArray,
+                    status: Int,
+                ) {
+                    handleCharacteristicRead(gattConn, characteristic, value, status)
+                }
+
+                @Deprecated("Deprecated in Java")
+                override fun onCharacteristicRead(
+                    gattConn: BluetoothGatt,
+                    characteristic: BluetoothGattCharacteristic,
+                    status: Int,
+                ) {
+                    handleCharacteristicRead(
+                        gattConn,
+                        characteristic,
+                        characteristic.value ?: ByteArray(0),
+                        status,
+                    )
+                }
+
+                private fun handleCharacteristicRead(
+                    gattConn: BluetoothGatt,
+                    characteristic: BluetoothGattCharacteristic,
+                    value: ByteArray,
+                    status: Int,
+                ) {
+                    if (status != BluetoothGatt.GATT_SUCCESS) {
+                        finishWithError(gattConn, "BLE read failed for ${characteristic.uuid} with status $status")
+                        return
+                    }
+
+                    val text = value.toString(StandardCharsets.UTF_8).trimEnd('\u0000')
+                    when (characteristic.uuid) {
+                        AppConfig.firmwareRevisionUuid -> {
+                            disValues["firmware"] = text
+                            readCharacteristic(gattConn, AppConfig.deviceInfoServiceUuid, AppConfig.softwareRevisionUuid)
+                        }
+                        AppConfig.softwareRevisionUuid -> {
+                            disValues["software"] = text
+                            readCharacteristic(gattConn, AppConfig.deviceInfoServiceUuid, AppConfig.hardwareRevisionUuid)
+                        }
+                        AppConfig.hardwareRevisionUuid -> {
+                            disValues["hardware"] = text
+                            val service = gattConn.getService(AppConfig.versionServiceUuid)
+                            val versionCharacteristic = service?.getCharacteristic(AppConfig.versionCharacteristicUuid)
+                            if (versionCharacteristic == null) {
+                                completeSuccess(gattConn)
+                            } else {
+                                gattConn.readCharacteristic(versionCharacteristic)
+                            }
+                        }
+                        AppConfig.versionCharacteristicUuid -> {
+                            payload = runCatching { gson.fromJson(text, ExtendedVersionPayload::class.java) }.getOrNull()
+                            completeSuccess(gattConn)
+                        }
+                        else -> completeSuccess(gattConn)
+                    }
+                }
+
+                private fun readCharacteristic(
+                    gattConn: BluetoothGatt,
+                    serviceUuid: java.util.UUID,
+                    characteristicUuid: java.util.UUID,
+                ) {
+                    val service = gattConn.getService(serviceUuid)
+                        ?: return finishWithError(gattConn, "Missing BLE service $serviceUuid")
+                    val characteristic = service.getCharacteristic(characteristicUuid)
+                        ?: return finishWithError(gattConn, "Missing BLE characteristic $characteristicUuid")
+                    gattConn.readCharacteristic(characteristic)
+                }
+
+                private fun completeSuccess(gattConn: BluetoothGatt) {
+                    if (!continuation.isActive) {
+                        gattConn.close()
+                        return
+                    }
+                    val firmware = payload?.fw ?: disValues["firmware"].orEmpty()
+                    val channel = payload?.channel ?: disValues["software"].orEmpty()
+                    val hardware = payload?.hw ?: disValues["hardware"].orEmpty()
+                    continuation.resume(
+                        Result.success(
+                            DeviceVersion(
+                                firmwareRev = firmware,
+                                softwareRev = channel,
+                                hardwareRev = hardware,
+                                versionCode = payload?.code ?: DeviceVersion.fromSemver(firmware),
+                                securityEpoch = payload?.epoch ?: 0,
+                                channel = if (channel.isBlank()) "stable" else channel,
+                            ),
+                        ),
+                    )
+                    gattConn.disconnect()
+                    gattConn.close()
+                }
+
+                private fun finishWithError(gattConn: BluetoothGatt, message: String) {
+                    if (continuation.isActive) {
+                        continuation.resume(Result.failure(IllegalStateException(message)))
+                    }
+                    gattConn.disconnect()
+                    gattConn.close()
+                }
+            }
+
+            Handler(Looper.getMainLooper()).post {
+                gatt = runCatching {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                         device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
                     } else {
                         device.connectGatt(context, false, callback)
                     }
-
-                    continuation.invokeOnCancellation {
-                        gatt?.disconnect()
-                        gatt?.close()
+                }.getOrElse { error ->
+                    if (continuation.isActive) {
+                        continuation.resume(Result.failure(error))
                     }
-                }.getOrThrow()
+                    null
+                }
             }
-        }
+
+            continuation.invokeOnCancellation {
+                gatt?.disconnect()
+                gatt?.close()
+            }
+        }.getOrThrow()
+    }
+
+    private fun isRetryableGattFailure(error: Throwable?): Boolean {
+        val message = error?.message.orEmpty()
+        return "status 133" in message || "Disconnected before version read completed" in message
     }
 
     private fun checkBluetoothPermission() {
@@ -207,4 +249,3 @@ class BleDeviceVersionReader(private val context: Context) {
         val hw: String? = null,
     )
 }
-

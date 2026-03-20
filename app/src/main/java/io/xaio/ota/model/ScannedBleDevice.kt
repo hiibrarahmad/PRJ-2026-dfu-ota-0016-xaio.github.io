@@ -4,5 +4,6 @@ data class ScannedBleDevice(
     val address: String,
     val name: String,
     val rssi: Int,
+    val isConnectable: Boolean,
+    val advertisesVersionService: Boolean,
 )
-
